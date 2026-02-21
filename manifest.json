@@ -1,29 +1,36 @@
 {
-  "manifest_version": 3,
-  "name": "Instagram Photo Extractor",
-  "version": "1.7",
-  "description": "Extracts photos from Instagram posts and displays them in full resolution.",
+  "manifest_version": 2,
+  "name": "Instagram Media Extractor",
+  "version": "2.0",
+  "description": "Downloads photos and videos from Instagram posts, reels, and stories.",
   "permissions": [
     "activeTab",
-    "tabs"
-  ],
-  "host_permissions": [
+    "tabs",
     "https://*.instagram.com/*",
     "https://*.cdninstagram.com/*",
     "https://*.fbcdn.net/*",
     "https://*.i.instagram.com/*"
   ],
   "background": {
-    "service_worker": "background.js"
+    "scripts": [
+      "background.js"
+    ],
+    "persistent": false
   },
-  "action": {
+  "browser_action": {
     "default_popup": "popup.html",
     "default_icon": {
-      "48": "icons/icon.png"
+      "16": "icons/icon-16.png",
+      "32": "icons/icon-32.png",
+      "48": "icons/icon-48.png"
     }
   },
   "icons": {
-    "48": "icons/icon.png"
+    "16": "icons/icon-16.png",
+    "32": "icons/icon-32.png",
+    "48": "icons/icon-48.png",
+    "96": "icons/icon-96.png",
+    "128": "icons/icon-128.png"
   },
   "content_scripts": [
     {
@@ -35,5 +42,18 @@
       ],
       "run_at": "document_idle"
     }
-  ]
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "{8508cde8-6ea7-4ee9-9713-74e66cbae8cd}",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
+  }
 }

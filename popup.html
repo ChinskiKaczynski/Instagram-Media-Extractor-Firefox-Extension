@@ -2,49 +2,17 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Instagram Photo Extractor</title>
+  <title>Instagram Media Extractor</title>
   <link rel="stylesheet" href="styles.css">
-  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600&display=swap" rel="stylesheet">
 </head>
 <body>
   <div class="container">
-    <h1>Instagram Photo Extractor</h1>
-    <p class="description">Click the button below to extract high-resolution photos from the current Instagram post.</p>
-    <button id="extractPhotos" class="btn">Extract Photo</button>
-    <div id="photoContainer"></div>
-    <div class="instructions">
-      <h2>Step-by-Step Instructions</h2>
-      <ol>
-        <li><strong>Go to Instagram website:</strong></li>
-          <ul>
-            <li>Open your web browser and type in the address bar: <a href="https://www.instagram.com" target="_blank">www.instagram.com</a>.</li>
-            <li>Log in to your account using your username and password.</li>
-          </ul>
-        </li>
-        <li>
-          <strong>Find a specific user:</strong>
-          <ul>
-            <li>In the search bar at the top of the page, type the username of the user whose post you want to view.</li>
-            <li>Click on the username in the search results to go to their profile.</li>
-          </ul>
-        </li>
-        <li>
-          <strong>Open a specific post:</strong>
-          <ul>
-            <li>On the user's profile, find the post from which you want to extract the photo.</li>
-            <li>Click on that post to open it in full-screen mode.</li>
-          </ul>
-        </li>
-        <li>
-          <strong>Use the Instagram Photo Extractor extension:</strong>
-          <ul>
-            <li>Click on the extension icon in the browser's toolbar.</li>
-            <li>In the opened popup window, click the "Extract Photos" button to extract the photo in full resolution.</li>
-          </ul>
-        </li>
-      </ol>
-    </div>
-    <p class="footer">&copy; 2024 Instagram Photo Extractor</p>
+    <h1>Instagram Media Extractor</h1>
+    <p class="description">
+      Open an Instagram post, reel, or story and click the button to download the currently active media.
+    </p>
+    <button id="extractMedia" class="btn">Download Current Media</button>
+    <p class="hint">Supports photos and videos.</p>
   </div>
   <script src="popup.js"></script>
 </body>
