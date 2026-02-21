@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Instagram Media Extractor",
-  "version": "2.0",
+  "version": "2.1",
   "description": "Downloads photos and videos from Instagram posts, reels, and stories.",
   "permissions": [
     "activeTab",
@@ -32,6 +32,9 @@
     "96": "icons/icon-96.png",
     "128": "icons/icon-128.png"
   },
+  "web_accessible_resources": [
+    "icons/*"
+  ],
   "content_scripts": [
     {
       "matches": [

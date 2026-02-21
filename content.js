@@ -6,6 +6,18 @@
   };
   const DOM_RETRY_COUNT = 6;
   const DOM_RETRY_DELAY_MS = 500;
+  const PERFORMANCE_VIDEO_MAX_AGE_STORY_MS = 15000;
+  const PERFORMANCE_VIDEO_MAX_AGE_POST_MS = 8000;
+  const MEDIA_PREFETCH_TTL_MS = 3500;
+  const API_PREFETCH_TTL_MS = 10000;
+  const FLOATING_BUTTON_ID = "ig-media-extractor-floating-button";
+  const FLOATING_BUTTON_STORAGE_KEY = "ig-media-extractor-floating-button-position-v1";
+  const FLOATING_BUTTON_SIZE_PX = 64;
+  const FLOATING_BUTTON_MARGIN_PX = 14;
+  let mediaPrefetchCache = null;
+  let apiPrefetchCache = null;
+  let apiPrefetchInFlight = null;
+  let floatingButtonInitialized = false;
 
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -33,13 +45,50 @@
 
   async function extractMedia() {
     const inStories = window.location.pathname.includes("/stories/");
+    const contextKey = getCurrentMediaContextKey();
+    const storyIdHint = inStories ? getStoryIdFromHref() : null;
     const canonicalPath = getCanonicalPathname();
     const canonicalLooksVideo = /\/(reel|reels|tv)\//i.test(canonicalPath);
     let mediaSource = "none";
     let mediaInfo = null;
+    let domMediaQuick = normalizeMediaInfo(extractMediaViaDomOnce());
+    if (domMediaQuick?.url) {
+      storeMediaPrefetch(domMediaQuick, contextKey);
+    } else {
+      domMediaQuick = getFreshMediaPrefetch(contextKey);
+    }
 
-    const apiMedia = normalizeMediaInfo(await extractMediaViaApi());
-    const domMediaQuick = normalizeMediaInfo(extractMediaViaDomOnce());
+    const cachedApiMedia = getFreshApiPrefetch(contextKey);
+    const apiPromise = cachedApiMedia ? Promise.resolve(cachedApiMedia) : prefetchApiForCurrentContext(contextKey, storyIdHint);
+
+    const apiMedia = normalizeMediaInfo(await apiPromise);
+
+    // For stories, API is the source of truth. DOM can contain transient video elements
+    // that do not belong to the currently visible story frame.
+    if (inStories) {
+      if (apiMedia?.url) {
+        mediaInfo = apiMedia;
+        mediaSource = "api-story";
+      } else if (domMediaQuick?.url) {
+        mediaInfo = domMediaQuick;
+        mediaSource = domMediaQuick.url.startsWith("blob:") ? "dom-fast-story-blob" : "dom-fast-story";
+      } else {
+        const mediaFromDom = normalizeMediaInfo(await extractMediaViaDom());
+        if (mediaFromDom?.url) {
+          mediaInfo = mediaFromDom;
+          mediaSource = "dom-retry-story";
+        }
+      }
+
+      if (!mediaInfo?.url) {
+        console.log("No media found.");
+        return;
+      }
+
+      console.log("Selected media:", mediaSource, mediaInfo.type, mediaInfo.url);
+      await openMedia(mediaInfo);
+      return;
+    }
 
     if (apiMedia?.url) {
       mediaInfo = apiMedia;
@@ -93,21 +142,23 @@
     await openMedia(mediaInfo);
   }
 
-  async function extractMediaViaApi() {
+  async function extractMediaViaApi(storyIdHint = null) {
     if (window.location.pathname.includes("/stories/")) {
-      return await extractStoryMediaViaApi();
+      return await extractStoryMediaViaApi(storyIdHint);
     }
     return await extractPostMediaViaApi();
   }
 
-  async function extractStoryMediaViaApi() {
-    let storyId = null;
-    for (let attempt = 0; attempt < 5; attempt++) {
-      storyId = window.location.href.match(/\/stories\/[^\/]+\/(\d+)/)?.[1];
-      if (storyId) {
-        break;
+  async function extractStoryMediaViaApi(storyIdHint = null) {
+    let storyId = storyIdHint;
+    if (!storyId) {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        storyId = getStoryIdFromHref();
+        if (storyId) {
+          break;
+        }
+        await delay(200);
       }
-      await delay(1000);
     }
 
     if (!storyId) {
@@ -117,20 +168,437 @@
     const storyUrl = `https://i.instagram.com/api/v1/media/${storyId}/info/`;
     const data = await fetchMediaInfo(storyUrl);
     const storyItem = data?.items?.[0];
-    return getMediaInfoFromApiItem(storyItem);
+    const mediaInfo = getMediaInfoFromApiItem(storyItem);
+    if (!mediaInfo) {
+      return null;
+    }
+
+    if (!mediaInfo.accountName) {
+      mediaInfo.accountName = getUsernameFromPath(window.location.pathname) || null;
+    }
+    return mediaInfo;
   }
 
-  function getPostInfoFromUrl() {
-    // Instagram can serve post URLs both as /p/<shortcode>/ and /<username>/p/<shortcode>/.
-    const match = window.location.pathname.match(/^\/(?:[^\/?#]+\/)?(p|reel|reels|tv)\/([^\/?#]+)/i);
+  function prefetchApiForCurrentContext(contextKey, storyIdHint = null) {
+    if (apiPrefetchInFlight?.contextKey === contextKey) {
+      return apiPrefetchInFlight.promise;
+    }
+
+    const promise = extractMediaViaApi(storyIdHint)
+      .then(normalizeMediaInfo)
+      .then((mediaInfo) => {
+        if (mediaInfo?.url) {
+          storeApiPrefetch(mediaInfo, contextKey);
+        }
+        return mediaInfo;
+      })
+      .catch((error) => {
+        console.warn("API media extraction failed:", error);
+        return null;
+      })
+      .finally(() => {
+        if (apiPrefetchInFlight?.contextKey === contextKey) {
+          apiPrefetchInFlight = null;
+        }
+      });
+
+    apiPrefetchInFlight = { contextKey, promise };
+    return promise;
+  }
+
+  function getStoryIdFromHref(href = window.location.href) {
+    const source = typeof href === "string" ? href : "";
+    return source.match(/\/stories\/[^\/]+\/(\d+)/)?.[1] || null;
+  }
+
+  function getCurrentMediaContextKey() {
+    if (window.location.pathname.includes("/stories/")) {
+      return `story:${getStoryIdFromHref() || "unknown"}`;
+    }
+
+    const postInfo = getPostInfoFromUrl();
+    if (postInfo?.shortcode) {
+      const carouselIndex = getCurrentCarouselIndexFromDom() || 1;
+      return `post:${postInfo.shortcode}:${carouselIndex}`;
+    }
+
+    return `path:${window.location.pathname}`;
+  }
+
+  function storeMediaPrefetch(mediaInfo, contextKey) {
+    if (!mediaInfo?.url) {
+      return;
+    }
+
+    mediaPrefetchCache = {
+      key: contextKey,
+      storedAt: Date.now(),
+      mediaInfo: normalizeMediaInfo(mediaInfo)
+    };
+  }
+
+  function storeApiPrefetch(mediaInfo, contextKey) {
+    if (!mediaInfo?.url) {
+      return;
+    }
+
+    apiPrefetchCache = {
+      key: contextKey,
+      storedAt: Date.now(),
+      mediaInfo: normalizeMediaInfo(mediaInfo)
+    };
+  }
+
+  function getFreshMediaPrefetch(contextKey) {
+    if (!mediaPrefetchCache || mediaPrefetchCache.key !== contextKey) {
+      return null;
+    }
+
+    if (Date.now() - mediaPrefetchCache.storedAt > MEDIA_PREFETCH_TTL_MS) {
+      return null;
+    }
+
+    return mediaPrefetchCache.mediaInfo;
+  }
+
+  function getFreshApiPrefetch(contextKey) {
+    if (!apiPrefetchCache || apiPrefetchCache.key !== contextKey) {
+      return null;
+    }
+
+    if (Date.now() - apiPrefetchCache.storedAt > API_PREFETCH_TTL_MS) {
+      return null;
+    }
+
+    return apiPrefetchCache.mediaInfo;
+  }
+
+  function prefetchCurrentMedia() {
+    const contextKey = getCurrentMediaContextKey();
+    const storyIdHint = window.location.pathname.includes("/stories/") ? getStoryIdFromHref() : null;
+    const domMedia = normalizeMediaInfo(extractMediaViaDomOnce());
+    if (domMedia?.url) {
+      storeMediaPrefetch(domMedia, contextKey);
+    }
+
+    void prefetchApiForCurrentContext(contextKey, storyIdHint);
+  }
+
+  function getRuntimeAssetUrl(path) {
+    try {
+      if (browser.runtime && typeof browser.runtime.getURL === "function") {
+        return browser.runtime.getURL(path);
+      }
+    } catch (error) {
+      // Ignored: runtime API may be unavailable in non-extension harness.
+    }
+
+    return "";
+  }
+
+  function readFloatingButtonPosition() {
+    try {
+      const raw = window.localStorage.getItem(FLOATING_BUTTON_STORAGE_KEY);
+      if (!raw) {
+        return null;
+      }
+
+      const parsed = JSON.parse(raw);
+      if (!Number.isFinite(parsed?.x) || !Number.isFinite(parsed?.y)) {
+        return null;
+      }
+
+      return { x: parsed.x, y: parsed.y };
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function saveFloatingButtonPosition(position) {
+    if (!position || !Number.isFinite(position.x) || !Number.isFinite(position.y)) {
+      return;
+    }
+
+    try {
+      window.localStorage.setItem(FLOATING_BUTTON_STORAGE_KEY, JSON.stringify(position));
+    } catch (error) {
+      // Ignored: storage may be disabled.
+    }
+  }
+
+  function clampFloatingButtonPosition(position) {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth || 0;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 0;
+
+    const minX = FLOATING_BUTTON_MARGIN_PX;
+    const minY = FLOATING_BUTTON_MARGIN_PX;
+    const maxX = Math.max(minX, viewportWidth - FLOATING_BUTTON_SIZE_PX - FLOATING_BUTTON_MARGIN_PX);
+    const maxY = Math.max(minY, viewportHeight - FLOATING_BUTTON_SIZE_PX - FLOATING_BUTTON_MARGIN_PX);
+
+    return {
+      x: Math.min(maxX, Math.max(minX, Number.isFinite(position?.x) ? position.x : maxX)),
+      y: Math.min(maxY, Math.max(minY, Number.isFinite(position?.y) ? position.y : maxY))
+    };
+  }
+
+  function applyFloatingButtonPosition(button, position) {
+    const next = clampFloatingButtonPosition(position);
+    button.style.left = `${Math.round(next.x)}px`;
+    button.style.top = `${Math.round(next.y)}px`;
+    button.style.right = "auto";
+    button.style.bottom = "auto";
+    return next;
+  }
+
+  function getFloatingButtonRectPosition(button) {
+    const rect = button.getBoundingClientRect();
+    return { x: rect.left, y: rect.top };
+  }
+
+  function setFloatingButtonBusy(button, isBusy) {
+    button.dataset.busy = isBusy ? "true" : "false";
+    button.style.opacity = isBusy ? "0.75" : "1";
+    button.style.cursor = isBusy ? "progress" : "grab";
+  }
+
+  function createFloatingButtonIcon(button) {
+    const iconUrl = getRuntimeAssetUrl("icons/icon-48.png");
+    if (!iconUrl) {
+      button.textContent = "DL";
+      button.style.fontSize = "13px";
+      button.style.fontWeight = "700";
+      button.style.color = "#fff";
+      return;
+    }
+
+    const icon = document.createElement("img");
+    icon.src = iconUrl;
+    icon.alt = "Instagram Media Extractor";
+    icon.width = 36;
+    icon.height = 36;
+    icon.style.display = "block";
+    icon.style.pointerEvents = "none";
+    icon.addEventListener("error", () => {
+      icon.remove();
+      button.textContent = "DL";
+      button.style.fontSize = "13px";
+      button.style.fontWeight = "700";
+      button.style.color = "#fff";
+    }, { once: true });
+    button.appendChild(icon);
+  }
+
+  function ensureFloatingButton() {
+    if (window.top !== window.self) {
+      return null;
+    }
+
+    const existing = document.getElementById(FLOATING_BUTTON_ID);
+    if (existing) {
+      return existing;
+    }
+
+    const button = document.createElement("button");
+    button.id = FLOATING_BUTTON_ID;
+    button.type = "button";
+    button.title = "Download current Instagram media";
+    button.setAttribute("aria-label", "Download current Instagram media");
+    button.setAttribute("draggable", "false");
+    button.style.position = "fixed";
+    button.style.width = `${FLOATING_BUTTON_SIZE_PX}px`;
+    button.style.height = `${FLOATING_BUTTON_SIZE_PX}px`;
+    button.style.borderRadius = "999px";
+    button.style.border = "1px solid rgba(255,255,255,0.25)";
+    button.style.background = "linear-gradient(145deg, #ff4f5e 0%, #ff8f3f 100%)";
+    button.style.boxShadow = "0 12px 28px rgba(0, 0, 0, 0.32)";
+    button.style.zIndex = "2147483647";
+    button.style.display = "flex";
+    button.style.alignItems = "center";
+    button.style.justifyContent = "center";
+    button.style.padding = "0";
+    button.style.margin = "0";
+    button.style.outline = "none";
+    button.style.userSelect = "none";
+    button.style.webkitUserSelect = "none";
+    button.style.touchAction = "none";
+    button.style.cursor = "grab";
+    button.style.transition = "transform 120ms ease, opacity 120ms ease, box-shadow 120ms ease";
+    button.style.color = "#fff";
+    button.style.overflow = "hidden";
+    button.oncontextmenu = (event) => event.preventDefault();
+
+    createFloatingButtonIcon(button);
+
+    const saved = readFloatingButtonPosition();
+    const defaultPosition = {
+      x: (window.innerWidth || 0) - FLOATING_BUTTON_SIZE_PX - 20,
+      y: (window.innerHeight || 0) - FLOATING_BUTTON_SIZE_PX - 80
+    };
+    applyFloatingButtonPosition(button, saved || defaultPosition);
+
+    const dragState = {
+      pointerId: null,
+      startPointerX: 0,
+      startPointerY: 0,
+      startButtonX: 0,
+      startButtonY: 0,
+      moved: false,
+      suppressClick: false,
+      busy: false
+    };
+
+    button.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0 || dragState.busy) {
+        return;
+      }
+
+      dragState.pointerId = event.pointerId;
+      dragState.startPointerX = event.clientX;
+      dragState.startPointerY = event.clientY;
+      const current = getFloatingButtonRectPosition(button);
+      dragState.startButtonX = current.x;
+      dragState.startButtonY = current.y;
+      dragState.moved = false;
+      button.style.transition = "none";
+      button.style.cursor = "grabbing";
+
+      try {
+        button.setPointerCapture(event.pointerId);
+      } catch (error) {
+        // Ignored.
+      }
+    });
+
+    button.addEventListener("pointermove", (event) => {
+      if (dragState.pointerId !== event.pointerId) {
+        return;
+      }
+
+      const deltaX = event.clientX - dragState.startPointerX;
+      const deltaY = event.clientY - dragState.startPointerY;
+      if (Math.abs(deltaX) > 4 || Math.abs(deltaY) > 4) {
+        dragState.moved = true;
+      }
+
+      const next = applyFloatingButtonPosition(button, {
+        x: dragState.startButtonX + deltaX,
+        y: dragState.startButtonY + deltaY
+      });
+      if (dragState.moved) {
+        saveFloatingButtonPosition(next);
+      }
+    });
+
+    function finishDrag(event) {
+      if (dragState.pointerId !== event.pointerId) {
+        return;
+      }
+
+      if (dragState.moved) {
+        dragState.suppressClick = true;
+        saveFloatingButtonPosition(getFloatingButtonRectPosition(button));
+      }
+
+      dragState.pointerId = null;
+      button.style.transition = "transform 120ms ease, opacity 120ms ease, box-shadow 120ms ease";
+      setFloatingButtonBusy(button, dragState.busy);
+    }
+
+    button.addEventListener("pointerup", finishDrag);
+    button.addEventListener("pointercancel", finishDrag);
+
+    button.addEventListener("click", async (event) => {
+      if (dragState.suppressClick) {
+        dragState.suppressClick = false;
+        event.preventDefault();
+        event.stopPropagation();
+        return;
+      }
+
+      if (dragState.busy) {
+        event.preventDefault();
+        return;
+      }
+
+      dragState.busy = true;
+      button.style.transform = "scale(0.96)";
+      setFloatingButtonBusy(button, true);
+      try {
+        await extractMedia();
+      } finally {
+        dragState.busy = false;
+        setFloatingButtonBusy(button, false);
+        button.style.transform = "scale(1)";
+      }
+    });
+
+    button.addEventListener("pointerenter", () => {
+      if (!dragState.busy) {
+        button.style.boxShadow = "0 14px 34px rgba(0, 0, 0, 0.42)";
+      }
+      prefetchCurrentMedia();
+    });
+
+    button.addEventListener("pointerleave", () => {
+      if (!dragState.busy) {
+        button.style.boxShadow = "0 12px 28px rgba(0, 0, 0, 0.32)";
+      }
+    });
+
+    window.addEventListener("resize", () => {
+      const next = applyFloatingButtonPosition(button, getFloatingButtonRectPosition(button));
+      saveFloatingButtonPosition(next);
+    });
+
+    (document.body || document.documentElement).appendChild(button);
+    return button;
+  }
+
+  function initFloatingButton() {
+    if (floatingButtonInitialized) {
+      return;
+    }
+    floatingButtonInitialized = true;
+
+    const boot = () => {
+      const button = ensureFloatingButton();
+      if (!button) {
+        floatingButtonInitialized = false;
+        return;
+      }
+      prefetchCurrentMedia();
+    };
+
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", boot, { once: true });
+      return;
+    }
+    boot();
+  }
+
+  function parsePostInfoFromPath(pathname) {
+    const source = typeof pathname === "string" ? pathname : "";
+    // Instagram can serve media URLs both as /p/<shortcode>/ and /<username>/p/<shortcode>/.
+    const match = source.match(/^\/(?:[^\/?#]+\/)?(p|reel|reels|tv)\/([^\/?#]+)/i);
     if (!match) {
       return null;
     }
 
+    const rawPostType = match[1].toLowerCase();
+    const normalizedPostType = rawPostType === "reels" ? "reel" : rawPostType;
     return {
-      postType: match[1].toLowerCase(),
+      postType: normalizedPostType,
       shortcode: match[2]
     };
+  }
+
+  function getPostInfoFromUrl() {
+    const fromPath = parsePostInfoFromPath(window.location.pathname);
+    if (fromPath) {
+      return fromPath;
+    }
+
+    return parsePostInfoFromPath(getCanonicalPathname());
   }
 
   function getFileTokenFromUrl(url) {
@@ -237,6 +705,15 @@
     return ranked[0]?.url || null;
   }
 
+  function getApiItemUsername(item) {
+    const username =
+      item?.user?.username
+      || item?.owner?.username
+      || item?.caption?.user?.username
+      || null;
+    return typeof username === "string" && username ? username : null;
+  }
+
   function getMediaInfoFromApiItem(item) {
     if (!item) {
       return null;
@@ -245,17 +722,18 @@
     const hasVideo = isVideoApiItem(item);
     const videoUrl = pickBestVideoVersionUrl(item);
     const imageUrl = pickBestImageCandidateUrl(item);
+    const accountName = getApiItemUsername(item);
 
     if (hasVideo && videoUrl) {
-      return { url: videoUrl, type: "video" };
+      return { url: videoUrl, type: "video", accountName };
     }
 
     if (imageUrl) {
-      return { url: imageUrl, type: "photo" };
+      return { url: imageUrl, type: "photo", accountName };
     }
 
     if (videoUrl) {
-      return { url: videoUrl, type: "video" };
+      return { url: videoUrl, type: "video", accountName };
     }
 
     return null;
@@ -513,7 +991,15 @@
       return null;
     }
 
-    return getMediaInfoFromApiItem(selectedMedia);
+    const mediaInfo = getMediaInfoFromApiItem(selectedMedia);
+    if (!mediaInfo) {
+      return null;
+    }
+
+    if (!mediaInfo.accountName) {
+      mediaInfo.accountName = getApiItemUsername(mediaItem);
+    }
+    return mediaInfo;
   }
 
   function getLargestVisibleElement(candidates) {
@@ -629,14 +1115,16 @@
   }
 
   function getMediaInfoFromElement(mediaElement) {
+    const accountName = getCurrentAccountName();
+
     if (mediaElement instanceof HTMLVideoElement) {
       const videoUrl = getVideoUrl(mediaElement);
-      return videoUrl ? { url: videoUrl, type: "video" } : null;
+      return videoUrl ? { url: videoUrl, type: "video", accountName } : null;
     }
 
     if (mediaElement instanceof HTMLImageElement) {
       const imageUrl = getBestImageUrl(mediaElement);
-      return imageUrl ? { url: imageUrl, type: "photo" } : null;
+      return imageUrl ? { url: imageUrl, type: "photo", accountName } : null;
     }
 
     return null;
@@ -767,7 +1255,7 @@
       ? (largest.currentSrc || largest.src || null)
       : getBestImageUrl(largest);
 
-    return mediaUrl ? { url: mediaUrl, type } : null;
+    return mediaUrl ? { url: mediaUrl, type, accountName: getCurrentAccountName() } : null;
   }
 
   function getVideoUrl(videoElement) {
@@ -794,6 +1282,9 @@
 
         const rect = video.getBoundingClientRect();
         const isVisible = isVisibleElement(video);
+        if (!isVisible) {
+          return null;
+        }
         const area = rect.width * rect.height;
         let score = area;
 
@@ -819,7 +1310,14 @@
       .sort((a, b) => b.score - a.score);
 
     const best = ranked[0];
-    return best ? { url: best.url, type: "video" } : null;
+    if (!best) {
+      return null;
+    }
+    return {
+      url: best.url,
+      type: "video",
+      accountName: getUsernameFromPath(window.location.pathname) || getCurrentAccountName()
+    };
   }
 
   function sanitizeSegmentedVideoUrl(url) {
@@ -834,8 +1332,17 @@
     }
   }
 
+  function isLikelyAudioOnlyVideoUrl(url) {
+    const source = String(url || "").toLowerCase();
+    if (!source) {
+      return false;
+    }
+
+    return /mime_type=audio|[\/_.-]audio[\/_.-]|audio_codec|\/a1\/|\/a\/t\d\//i.test(source);
+  }
+
   function buildPerformanceVideoCandidates(options = {}) {
-    const maxAgeMs = Number.isFinite(options.maxAgeMs) ? options.maxAgeMs : Number.POSITIVE_INFINITY;
+    const maxAgeMs = Number.isFinite(options.maxAgeMs) ? options.maxAgeMs : PERFORMANCE_VIDEO_MAX_AGE_POST_MS;
     const now = Number.isFinite(performance.now()) ? performance.now() : 0;
     const entries = performance.getEntriesByType("resource");
     const candidates = new Map();
@@ -844,6 +1351,7 @@
       .filter((entry) => entry && typeof entry.name === "string")
       .filter((entry) => /cdninstagram\.com/i.test(entry.name))
       .filter((entry) => /\.(mp4)(\?|$)/i.test(entry.name) || /mime_type=video/i.test(entry.name))
+      .filter((entry) => !isLikelyAudioOnlyVideoUrl(entry.name))
       .filter((entry) => {
         if (!Number.isFinite(maxAgeMs)) {
           return true;
@@ -907,8 +1415,17 @@
     return best ? { url: best.url, type: "video" } : null;
   }
 
+  function getActivePostMediaTokenSet() {
+    const context = getActivePostMediaContext();
+    const mediaElement = context?.mediaElement || null;
+    if (!mediaElement) {
+      return new Set();
+    }
+    return new Set(getTokenCandidatesForMediaElement(mediaElement));
+  }
+
   function extractStoryVideoFromPerformance() {
-    return pickVideoFromPerformanceEntries({ maxAgeMs: 120000 });
+    return pickVideoFromPerformanceEntries({ maxAgeMs: PERFORMANCE_VIDEO_MAX_AGE_STORY_MS });
   }
 
   function pickBestStoryImage(imageElements) {
@@ -941,7 +1458,14 @@
     }
 
     const mediaUrl = getBestImageUrl(best);
-    return mediaUrl ? { url: mediaUrl, type: "photo" } : null;
+    if (!mediaUrl) {
+      return null;
+    }
+    return {
+      url: mediaUrl,
+      type: "photo",
+      accountName: getUsernameFromPath(window.location.pathname) || getCurrentAccountName()
+    };
   }
 
   function extractMediaViaDomOnce() {
@@ -999,7 +1523,7 @@
       const bestVideo = getLargestVisibleElement(videos);
       const videoUrl = getVideoUrl(bestVideo);
       if (videoUrl) {
-        return { url: videoUrl, type: "video" };
+        return { url: videoUrl, type: "video", accountName: getCurrentAccountName() };
       }
       await delay(intervalMs);
     }
@@ -1031,7 +1555,7 @@
       return false;
     }
 
-    return /\.mp4(\?|$)/i.test(url) || /mime_type=video/i.test(url) || /\/video\//i.test(url);
+    return /\.mp4(\?|$)/i.test(url) || /mime_type=video/i.test(url);
   }
 
   function normalizeMediaInfo(mediaInfo) {
@@ -1040,10 +1564,10 @@
     }
 
     if (mediaInfo.type !== "video" && looksLikeVideoUrl(mediaInfo.url)) {
-      return { url: mediaInfo.url, type: "video" };
+      return { ...mediaInfo, type: "video" };
     }
 
-    return mediaInfo;
+    return { ...mediaInfo };
   }
 
   function extractVideoFromMeta() {
@@ -1052,7 +1576,7 @@
       document.querySelector('meta[property="og:video:url"]')?.getAttribute("content") ||
       document.querySelector('meta[property="og:video:secure_url"]')?.getAttribute("content");
 
-    return ogVideo ? { url: ogVideo, type: "video" } : null;
+    return ogVideo ? { url: ogVideo, type: "video", accountName: getCurrentAccountName() } : null;
   }
 
   function extractMediaFromMeta() {
@@ -1063,7 +1587,7 @@
 
     const ogImage = document.querySelector('meta[property="og:image"]')?.getAttribute("content");
     if (ogImage) {
-      return { url: ogImage, type: "photo" };
+      return { url: ogImage, type: "photo", accountName: getCurrentAccountName() };
     }
 
     return null;
@@ -1141,18 +1665,158 @@
     return `${baseName}.${extension}`;
   }
 
-  function getFileName(mediaUrl, mimeType, mediaType) {
-    const mimeExtension = extFromMimeType(mimeType);
-    const fallbackExtension = mediaType === "video" ? "mp4" : "jpg";
+  function sanitizeFileComponent(value, fallback = "instagram") {
+    const normalized = String(value || "")
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/^@+/, "")
+      .replace(/[^a-z0-9._-]+/g, "_")
+      .replace(/^[_\-.]+|[_\-.]+$/g, "")
+      .slice(0, 40);
+
+    return normalized || fallback;
+  }
+
+  function formatDownloadTimestamp(date = new Date()) {
+    const pad2 = (value) => String(value).padStart(2, "0");
+    return `${date.getFullYear()}${pad2(date.getMonth() + 1)}${pad2(date.getDate())}_${pad2(date.getHours())}${pad2(date.getMinutes())}${pad2(date.getSeconds())}`;
+  }
+
+  function getUsernameFromPath(pathname) {
+    const source = typeof pathname === "string" ? pathname : "";
+    const storyMatch = source.match(/^\/stories\/([^\/?#]+)/i);
+    if (storyMatch?.[1]) {
+      return storyMatch[1];
+    }
+
+    const prefixedPostMatch = source.match(/^\/([^\/?#]+)\/(?:p|reel|reels|tv)\//i);
+    if (prefixedPostMatch?.[1]) {
+      return prefixedPostMatch[1];
+    }
+
+    return null;
+  }
+
+  function parsePossibleUsernameFromUrl(rawUrl) {
+    if (!rawUrl || typeof rawUrl !== "string") {
+      return null;
+    }
+
+    const RESERVED = new Set([
+      "p",
+      "reel",
+      "reels",
+      "tv",
+      "stories",
+      "explore",
+      "accounts",
+      "about",
+      "developer",
+      "direct",
+      "challenge",
+      "legal",
+      "privacy",
+      "terms"
+    ]);
 
     try {
-      const parsed = new URL(mediaUrl);
-      const lastSegment = parsed.pathname.split("/").pop();
-      const baseName = lastSegment || `instagram-media-${Date.now()}`;
-      return normalizeFileName(baseName, mimeExtension || fallbackExtension);
+      const parsed = new URL(rawUrl, window.location.origin);
+      const parts = parsed.pathname.split("/").filter(Boolean);
+      if (!parts.length) {
+        return null;
+      }
+
+      if (parts[0] === "stories" && parts[1]) {
+        return parts[1];
+      }
+
+      const first = parts[0];
+      if (first && !RESERVED.has(first.toLowerCase())) {
+        return first;
+      }
+      return null;
     } catch (error) {
-      return `instagram-media-${Date.now()}.${mimeExtension || fallbackExtension}`;
+      return null;
     }
+  }
+
+  function getUsernameFromDom() {
+    const selectors = [
+      "article header a[href^='/']",
+      "main article header a[href^='/']",
+      "main header a[href^='/']",
+      "header a[href^='/']",
+      "a[href^='/'][role='link']",
+      "main a[href^='/']"
+    ];
+
+    for (const selector of selectors) {
+      const nodes = Array.from(document.querySelectorAll(selector));
+      for (let i = 0; i < nodes.length && i < 40; i++) {
+        const href = nodes[i]?.getAttribute("href") || "";
+        const parsed = parsePossibleUsernameFromUrl(href);
+        if (parsed) {
+          return parsed;
+        }
+      }
+    }
+
+    return null;
+  }
+
+  function getCurrentAccountName() {
+    const pathUser = getUsernameFromPath(window.location.pathname);
+    if (pathUser) {
+      return pathUser;
+    }
+
+    const canonicalHref = document.querySelector("link[rel='canonical']")?.getAttribute("href");
+    const canonicalUser = parsePossibleUsernameFromUrl(canonicalHref);
+    if (canonicalUser) {
+      return canonicalUser;
+    }
+
+    const ogUrl = document.querySelector("meta[property='og:url']")?.getAttribute("content");
+    const ogUser = parsePossibleUsernameFromUrl(ogUrl);
+    if (ogUser) {
+      return ogUser;
+    }
+
+    const ogTitle = document.querySelector("meta[property='og:title']")?.getAttribute("content") || "";
+    const titleSources = [ogTitle, document.title || ""];
+    const titlePatterns = [
+      /^([^:]+?)\s+on Instagram/i,
+      /by\s+@?([a-z0-9._]+)/i,
+      /@([a-z0-9._]+)/i
+    ];
+    for (const source of titleSources) {
+      for (const pattern of titlePatterns) {
+        const match = source.match(pattern);
+        if (match?.[1]) {
+          return match[1];
+        }
+      }
+    }
+
+    return getUsernameFromDom() || "instagram";
+  }
+
+  function resolveAccountNameForFile(accountNameHint) {
+    const fromHint = sanitizeFileComponent(accountNameHint, "");
+    if (fromHint) {
+      return fromHint;
+    }
+    return sanitizeFileComponent(getCurrentAccountName(), "instagram");
+  }
+
+  function getFileName(mediaUrl, mimeType, mediaType, accountNameHint = "") {
+    const mimeExtension = extFromMimeType(mimeType);
+    const fallbackExtension = mediaType === "video" ? "mp4" : "jpg";
+    const extension = mimeExtension || fallbackExtension;
+    const accountName = resolveAccountNameForFile(accountNameHint);
+    const timestamp = formatDownloadTimestamp();
+    return normalizeFileName(`${accountName}_${timestamp}`, extension);
   }
 
   function triggerDownload(downloadUrl, fileName) {
@@ -1210,7 +1874,7 @@
     }
 
     const objectUrl = URL.createObjectURL(blob);
-    const fileName = getFileName(mediaUrl, blob.type, mediaType);
+    const fileName = getFileName(mediaUrl, blob.type, mediaType, options.accountName || "");
     triggerDownload(objectUrl, fileName);
     setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
   }
@@ -1276,15 +1940,29 @@
   }
 
   async function openMedia(mediaInfo) {
-    let { url: mediaUrl, type: mediaType } = mediaInfo;
+    let { url: mediaUrl, type: mediaType, accountName: mediaAccountName } = mediaInfo;
     const inStories = window.location.pathname.includes("/stories/");
+    const canonicalPath = getCanonicalPathname();
+    const isReelContext = /\/(reel|reels|tv)\//i.test(window.location.pathname) || /\/(reel|reels|tv)\//i.test(canonicalPath);
 
     if (mediaUrl.startsWith("blob:")) {
+      const preferredTokens = new Set();
+
       if (!inStories && mediaType === "video") {
         const apiPostVideo = normalizeMediaInfo(await extractPostMediaViaApi());
+        if (apiPostVideo?.accountName) {
+          mediaAccountName = apiPostVideo.accountName;
+        }
         if (apiPostVideo?.url && !apiPostVideo.url.startsWith("blob:") && apiPostVideo.type === "video") {
+          const apiToken = getFileTokenFromUrl(apiPostVideo.url);
+          if (apiToken) {
+            preferredTokens.add(apiToken);
+          }
           try {
-            await downloadMediaUrl(apiPostVideo.url, "video", { validateVideo: true });
+            await downloadMediaUrl(apiPostVideo.url, "video", {
+              validateVideo: true,
+              accountName: mediaAccountName
+            });
             console.log("Resolved blob URL from post API:", apiPostVideo.url);
             return;
           } catch (error) {
@@ -1294,8 +1972,15 @@
 
         const metaVideo = normalizeMediaInfo(extractVideoFromMeta());
         if (metaVideo?.url) {
+          const metaToken = getFileTokenFromUrl(metaVideo.url);
+          if (metaToken) {
+            preferredTokens.add(metaToken);
+          }
           try {
-            await downloadMediaUrl(metaVideo.url, "video", { validateVideo: true });
+            await downloadMediaUrl(metaVideo.url, "video", {
+              validateVideo: true,
+              accountName: mediaAccountName
+            });
             console.log("Resolved blob URL from meta:", metaVideo.url);
             return;
           } catch (error) {
@@ -1307,13 +1992,41 @@
       let performanceCandidates = [];
       if (mediaType === "video") {
         performanceCandidates = buildPerformanceVideoCandidates({
-          maxAgeMs: inStories ? 120000 : 30000
+          maxAgeMs: inStories ? PERFORMANCE_VIDEO_MAX_AGE_STORY_MS : PERFORMANCE_VIDEO_MAX_AGE_POST_MS
         });
+
+        const activeTokens = !inStories ? getActivePostMediaTokenSet() : new Set();
+        if (activeTokens.size > 0) {
+          const activeTokenMatched = performanceCandidates.filter((candidate) => {
+            const token = getFileTokenFromUrl(candidate.url);
+            return token && activeTokens.has(token);
+          });
+          if (activeTokenMatched.length > 0) {
+            performanceCandidates = activeTokenMatched;
+          }
+        }
+
+        if (preferredTokens.size > 0) {
+          const tokenMatched = performanceCandidates.filter((candidate) => {
+            const token = getFileTokenFromUrl(candidate.url);
+            return token && preferredTokens.has(token);
+          });
+          if (tokenMatched.length > 0) {
+            performanceCandidates = tokenMatched;
+          }
+        }
+
+        if (!inStories && isReelContext && preferredTokens.size === 0 && activeTokens.size === 0) {
+          performanceCandidates = [];
+        }
       }
 
       for (const candidate of performanceCandidates) {
         try {
-          await downloadMediaUrl(candidate.url, "video", { validateVideo: true });
+          await downloadMediaUrl(candidate.url, "video", {
+            validateVideo: true,
+            accountName: mediaAccountName
+          });
           console.log("Resolved blob URL from performance:", candidate.source, candidate.url);
           return;
         } catch (error) {
@@ -1321,7 +2034,7 @@
         }
       }
 
-      const blobFileName = getFileName(mediaUrl, "", mediaType);
+      const blobFileName = getFileName(mediaUrl, "", mediaType, mediaAccountName || "");
       try {
         await triggerBlobDownloadFromPageContext(mediaUrl, blobFileName);
         return;
@@ -1331,16 +2044,33 @@
     }
 
     try {
-      await downloadMediaUrl(mediaUrl, mediaType, { validateVideo: mediaType === "video" });
+      await downloadMediaUrl(mediaUrl, mediaType, {
+        validateVideo: mediaType === "video",
+        accountName: mediaAccountName
+      });
     } catch (error) {
-      console.warn("Blob download failed, opening media URL directly.", error);
-      window.open(mediaUrl, "_blank", "noopener");
+      console.warn("Blob download failed.", error);
+      const canOpenDirectly = /^https?:\/\//i.test(mediaUrl);
+      if (mediaType === "video" && canOpenDirectly) {
+        window.open(mediaUrl, "_blank", "noopener");
+      }
     }
   }
 
+  initFloatingButton();
+
   browser.runtime.onMessage.addListener((message) => {
+    if (!message || typeof message.action !== "string") {
+      return;
+    }
+
     if (message.action === "extractMedia") {
-      extractMedia();
+      void extractMedia();
+      return;
+    }
+
+    if (message.action === "prefetchMedia") {
+      prefetchCurrentMedia();
     }
   });
 })();
